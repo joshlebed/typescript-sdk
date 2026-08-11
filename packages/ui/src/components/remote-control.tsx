@@ -176,8 +176,8 @@ interface RemoteControlProps {
    * mode. Use it to render a richer status indicator (e.g.
    * "Camera · 1920×1080 · 30 fps · FaceTime HD").
    *
-   * Only iOS instances ever fire this callback; Android instances
-   * have no camera-injector path and stay silent.
+   * Fires on both platforms: limulator drives it on iOS, and
+   * scrcpy-webrtc's virtual camera relay drives it on Android 15.
    */
   onCameraDemandChange?: (active: boolean, granted?: boolean, camera?: CameraCaptureInfo) => void;
 
@@ -235,16 +235,17 @@ interface RemoteControlProps {
   cameraAspect?: CameraAspect;
 
   /**
-   * iOS only: when true, capture the user's microphone via
+   * When true, capture the user's microphone via
    * `getUserMedia({ audio: true })` and stream it live into the
-   * simulator's mock microphone. Unlike the camera (which is
-   * demand-driven by apps inside the sim), the microphone is
+   * device's mock microphone. Unlike the camera (which is
+   * demand-driven by apps inside the device), the microphone is
    * user-driven: flip this prop from a button in your UI. The
    * component handles the browser permission prompt, the WebRTC
    * track attach (no SDP renegotiation — the audio slot is
    * pre-allocated) and the `microphoneStart`/`microphoneStop`
-   * signaling to the host. Progress and failures are reported via
-   * `onMicrophoneStateChange`. Ignored on Android instances.
+   * signaling to the host.  Progress and failures are reported via
+   * `onMicrophoneStateChange`. Works on iOS simulators and
+   * Android 15 instances.
    */
   microphoneEnabled?: boolean;
 
@@ -635,7 +636,7 @@ export const RemoteControl = forwardRef<RemoteControlHandle, RemoteControlProps>
       packetsSent?: number;
       packetsLost?: number;
     } | null>(null);
-    // User-driven outbound microphone state (iOS only). Unlike the
+    // User-driven outbound microphone state. Unlike the
     // camera, the mic is toggled by the `microphoneEnabled` prop; the
     // track rides a pre-allocated sendonly audio transceiver so
     // enabling/disabling is just a `replaceTrack`, plus a
@@ -1777,7 +1778,6 @@ export const RemoteControl = forwardRef<RemoteControlHandle, RemoteControlProps>
     // handler firing on both `connected` and `completed`) must not
     // cancel an attach already in flight; only detach/teardown cancel.
     const attachMicrophone = (): Promise<void> => {
-      if (platform !== 'ios') return Promise.resolve();
       return runMicOp(() => attachMicrophoneOp());
     };
 
@@ -2368,33 +2368,25 @@ export const RemoteControl = forwardRef<RemoteControlHandle, RemoteControlProps>
         const videoTransceiver = peerConnection.addTransceiver('video', { direction: 'recvonly' });
 
         // Pre-allocate a sendonly slot for the user's camera so the
-        // sim can pull frames later without renegotiating SDP.
+        // device can pull frames later without renegotiating SDP.
         // Allocating up-front means we don't have to renegotiate the
-        // SDP when the simulator app actually opens its
-        // `AVCaptureSession` — the codec/SSRC negotiation happens
-        // once, here, and turning the camera on/off later is just a
-        // `replaceTrack`.
-        // iOS only: Android has no camera consumer, and the extra
-        // m=video line crashes Android 14's scrcpy/libwebrtc.
-        const outboundCameraTransceiver =
-          platform === 'ios' ?
-            peerConnection.addTransceiver('video', {
-              direction: 'sendonly',
-            })
-          : null;
-        outboundCameraSenderRef.current = outboundCameraTransceiver?.sender ?? null;
+        // SDP when an app actually opens its camera — the codec/SSRC
+        // negotiation happens once, here, and turning the camera
+        // on/off later is just a `replaceTrack`. Both platforms speak
+        // the same cameraRequest/cameraResult protocol (limulator on
+        // iOS, scrcpy-webrtc's virtual camera relay on Android 15).
+        const outboundCameraTransceiver = peerConnection.addTransceiver('video', {
+          direction: 'sendonly',
+        });
+        outboundCameraSenderRef.current = outboundCameraTransceiver.sender;
 
         // Same pre-allocation for the live microphone: a sendonly audio
         // slot negotiated once at connection setup, so toggling the mic
-        // later is just `replaceTrack` — no SDP renegotiation. iOS only,
-        // like the camera.
-        const outboundMicTransceiver =
-          platform === 'ios' ?
-            peerConnection.addTransceiver('audio', {
-              direction: 'sendonly',
-            })
-          : null;
-        outboundMicSenderRef.current = outboundMicTransceiver?.sender ?? null;
+        // later is just `replaceTrack` — no SDP renegotiation.
+        const outboundMicTransceiver = peerConnection.addTransceiver('audio', {
+          direction: 'sendonly',
+        });
+        outboundMicSenderRef.current = outboundMicTransceiver.sender;
 
         // As hardware encoder, we use H265 for iOS and VP9 for Android.
         // We make sure these two are the first ones in the list.
@@ -2783,12 +2775,11 @@ export const RemoteControl = forwardRef<RemoteControlHandle, RemoteControlProps>
               pendingScreenshotRejectersRef.current.delete(message.id);
               break;
             case 'cameraRequest': {
-              // Only iOS sessions allocate the sendonly outbound-camera
-              // transceiver; without it there is nothing to feed the sim, so
-              // ignore camera requests entirely — no getUserMedia prompt and
-              // no onCameraDemandChange callbacks. Android intentionally stays
-              // silent, as the API docs promise.
-              if (platform !== 'ios' || !outboundCameraSenderRef.current) {
+              // Without the pre-allocated sendonly outbound-camera
+              // transceiver there is nothing to feed the device, so ignore
+              // camera requests entirely — no getUserMedia prompt and no
+              // onCameraDemandChange callbacks.
+              if (!outboundCameraSenderRef.current) {
                 break;
               }
               const active = message.active === true;
